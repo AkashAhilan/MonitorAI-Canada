@@ -12,8 +12,9 @@ import os
 import sys
 import time
 from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -26,21 +27,25 @@ from camera.config import load_config
 from camera.rppg_infer import format_hr_display, infer_from_face_crops_bgr
 from camera.serial_servo import RateLimitedPan, ServoSerial
 from camera.tracking import FaceTracker, crop_face_bgr
+from camera.ui_dashboard import DASHBOARD_H, DASHBOARD_W, DashboardContext, render_dashboard
 
 log = logging.getLogger(__name__)
 
 SEARCH, LOCK, MEASURE = "SEARCH", "LOCK", "MEASURE"
 
 
-def draw_label(img, lines: List[Tuple[str, Tuple[int, int, int]]], x: int = 12, y0: int = 24) -> None:
-    y = y0
-    for text, color in lines:
-        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
-        y += 22
+def _rppg_bg_task(crops_bgr: list, fps: float, gen: int) -> tuple[int, Optional[Dict[str, Any]]]:
+    """Runs in worker thread; returns (generation, raw model dict) for stale-result discard."""
+    return gen, infer_from_face_crops_bgr(crops_bgr, fps)
 
 
 def main() -> None:
+    # Quieter TFLite / MediaPipe on Windows (still loads; less console spam).
+    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    for _name in ("tensorflow", "absl", "rppg"):
+        logging.getLogger(_name).setLevel(logging.ERROR)
+
     cfg = load_config()
 
     if cfg.INPUT_MODE == "video":
@@ -77,8 +82,10 @@ def main() -> None:
             flush=True,
         )
 
-    win = "Waiting-room monitor (q quit, r reset, s serial, c cap, v rec)"
+    win = "Monitor AI — Hospital Waiting Room"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    # Match framebuffer size so OpenCV does not upscale the composite (upscale = soft UI text).
+    cv2.resizeWindow(win, DASHBOARD_W, DASHBOARD_H)
 
     state = SEARCH
     consec_center = 0
@@ -86,8 +93,13 @@ def main() -> None:
     ref_cx: Optional[float] = None
     last_cmd = "—"
     last_hr_line = "HR: —"
+    last_bpm: Optional[float] = None
+    last_sqi: Optional[float] = None
+    last_rr: Optional[float] = None
     low_sqi_streak = 0
     last_infer_at = 0.0
+    infer_gen = 0
+    infer_future: Optional[Future] = None
     measure_crops: deque = deque(maxlen=cfg.MEASURE_BUFFER_FRAMES)
 
     recording = False
@@ -100,7 +112,9 @@ def main() -> None:
 
     def reset_search(reason: str) -> None:
         nonlocal state, consec_center, lock_started, ref_cx, measure_crops, low_sqi_streak, last_cmd
+        nonlocal last_hr_line, last_bpm, last_sqi, last_rr, infer_gen
         log.info("LOST→SEARCH (%s)", reason)
+        infer_gen += 1
         state = SEARCH
         consec_center = 0
         lock_started = 0.0
@@ -108,8 +122,11 @@ def main() -> None:
         measure_crops.clear()
         low_sqi_streak = 0
         last_cmd = "—"
+        last_hr_line = "HR: —"
+        last_bpm = last_sqi = last_rr = None
         pan.request_stop()
 
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rppg")
     try:
         while True:
             ok, frame = src.read()
@@ -124,23 +141,35 @@ def main() -> None:
                 inst = 1.0 / dt
                 fps_ema = inst if fps_ema is None else 0.92 * fps_ema + 0.08 * inst
 
-            h, w = frame.shape[:2]
+            # Apply completed rPPG (non-blocking); avoids stalling camera/UI on heavy TFLite work.
+            if infer_future is not None and infer_future.done():
+                g = -1
+                result: Optional[Dict[str, Any]] = None
+                try:
+                    g, result = infer_future.result()
+                except Exception:
+                    log.exception("rPPG inference")
+                infer_future = None
+                if g == infer_gen and state == MEASURE:
+                    last_hr_line, last_bpm, last_sqi, last_rr = format_hr_display(result)
+                    if not result or result.get("SQI") is None:
+                        low_sqi_streak += 1
+                    elif result["SQI"] < cfg.SQI_MIN:
+                        low_sqi_streak += 1
+                    else:
+                        low_sqi_streak = 0
+                    if low_sqi_streak >= cfg.LOW_SQI_FRAMES_BEFORE_ABORT:
+                        reset_search("low SQI or failed inference in MEASURE")
+                    else:
+                        log.debug("rPPG %s", last_hr_line)
+
+            _, w = frame.shape[:2]
             fc_x = w / 2.0
             box = tracker.pick_target(frame)
 
             if box is None:
-                cv2.line(frame, (int(fc_x), 0), (int(fc_x), h), (80, 80, 80), 1)
-                draw_label(
-                    frame,
-                    [
-                        (f"STATE: {state}", (0, 255, 255)),
-                        ("NO FACE", (0, 0, 255)),
-                        (f"frame_cx: {fc_x:.0f}", (200, 200, 200)),
-                        (f"fps~:{fps_ema:.1f}" if fps_ema else "fps~:—", (200, 200, 200)),
-                        (last_hr_line, (0, 255, 0)),
-                        (f"serial: {'ON' if cfg.SERIAL_ENABLED else 'OFF'} mock={cfg.MOCK_SERIAL}", (180, 180, 180)),
-                    ],
-                )
+                last_bpm = last_sqi = last_rr = None
+                last_hr_line = "HR: —"
                 if state == MEASURE:
                     reset_search("face lost in MEASURE")
                 elif state == LOCK:
@@ -149,12 +178,8 @@ def main() -> None:
                     pan.request_stop()
                 last_cmd = "—"
             else:
-                x1, y1, x2, y2 = box.x1, box.y1, box.x2, box.y2
                 face_cx = box.cx
                 err = face_cx - fc_x
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.line(frame, (int(fc_x), 0), (int(fc_x), h), (80, 80, 80), 1)
-                cv2.circle(frame, (int(face_cx), int((y1 + y2) / 2)), 5, (0, 255, 255), -1)
 
                 if state == SEARCH:
                     if cfg.SERIAL_ENABLED:
@@ -190,6 +215,7 @@ def main() -> None:
                     if abs(err) > cfg.CENTER_THRESHOLD_PX * 2:
                         reset_search("drift in LOCK")
                     elif time.monotonic() - lock_started >= cfg.SETTLE_MS / 1000.0:
+                        infer_gen += 1
                         state = MEASURE
                         ref_cx = face_cx
                         measure_crops.clear()
@@ -204,46 +230,45 @@ def main() -> None:
                         crop = crop_face_bgr(frame, box, cfg.FACE_CROP_SIZE)
                         measure_crops.append(crop.copy())
                         if (
-                            len(measure_crops) >= cfg.MEASURE_BUFFER_FRAMES
+                            infer_future is None
+                            and len(measure_crops) >= cfg.MEASURE_BUFFER_FRAMES
                             and (time.monotonic() - last_infer_at) * 1000.0 >= cfg.RPPG_INFER_EVERY_MS
                         ):
                             last_infer_at = time.monotonic()
                             fps_use = float(fps_ema or cfg.MEASURE_FPS_ASSUMED)
-                            result = infer_from_face_crops_bgr(list(measure_crops), fps_use)
-                            last_hr_line, _, _, _br = format_hr_display(result)
-                            if not result or result.get("SQI") is None:
-                                low_sqi_streak += 1
-                            elif result["SQI"] < cfg.SQI_MIN:
-                                low_sqi_streak += 1
-                            else:
-                                low_sqi_streak = 0
-                            if low_sqi_streak >= cfg.LOW_SQI_FRAMES_BEFORE_ABORT:
-                                reset_search("low SQI or failed inference in MEASURE")
-                            else:
-                                log.info("rPPG %s", last_hr_line)
+                            infer_future = executor.submit(
+                                _rppg_bg_task, list(measure_crops), fps_use, infer_gen
+                            )
 
-                lines = [
-                    (f"STATE: {state}", (0, 255, 255)),
-                    (f"face_cx: {face_cx:.0f}  frame_cx: {fc_x:.0f}  err: {err:+.0f}", (220, 220, 220)),
-                    (f"cmd: {last_cmd}", (255, 200, 100)),
-                    (last_hr_line, (0, 255, 128)),
-                    (f"measuring: {'YES' if state == MEASURE else 'no'}  buf:{len(measure_crops)}", (180, 180, 255)),
-                    (f"fps~:{fps_ema:.1f}" if fps_ema else "fps~:—", (150, 150, 150)),
-                    (
-                        f"serial: {'ON' if cfg.SERIAL_ENABLED else 'OFF'} mock={cfg.MOCK_SERIAL}",
-                        (150, 150, 150),
-                    ),
-                ]
-                draw_label(frame, lines)
+            ctx = DashboardContext(
+                state=state,
+                has_face=box is not None,
+                face_cx=box.cx if box is not None else None,
+                frame_cx=fc_x,
+                err_px=(box.cx - fc_x) if box is not None else 0.0,
+                last_cmd=last_cmd,
+                fps_ema=fps_ema,
+                last_bpm=last_bpm,
+                last_sqi=last_sqi,
+                last_rr=last_rr,
+                measure_buf_len=len(measure_crops),
+                measure_buf_max=cfg.MEASURE_BUFFER_FRAMES,
+                serial_enabled=cfg.SERIAL_ENABLED,
+                mock_serial=cfg.MOCK_SERIAL,
+                input_mode=cfg.INPUT_MODE,
+                recording=recording,
+            )
+            composite = render_dashboard(frame, ctx, box)
 
             if recording and writer is not None:
-                writer.write(frame)
-            cv2.imshow(win, frame)
+                writer.write(composite)
+            cv2.imshow(win, composite)
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord("q"):
                 break
             if key == ord("r"):
+                infer_gen += 1
                 state = SEARCH
                 consec_center = 0
                 lock_started = 0.0
@@ -251,6 +276,7 @@ def main() -> None:
                 measure_crops.clear()
                 low_sqi_streak = 0
                 last_hr_line = "HR: —"
+                last_bpm = last_sqi = last_rr = None
                 pan.request_stop()
                 log.info("reset→SEARCH (manual)")
             if key == ord("s"):
@@ -259,14 +285,15 @@ def main() -> None:
                 print(f"[serial] enabled={cfg.SERIAL_ENABLED}", flush=True)
             if key == ord("c"):
                 path = os.path.join(cfg.SMOKE_CAPTURE_DIR, f"app_frame_{frame_i}.png")
-                cv2.imwrite(path, frame)
+                cv2.imwrite(path, composite)
                 print(f"[capture] {path}", flush=True)
             if key == ord("v"):
                 if not recording:
                     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                    ow, oh = frame.shape[1], frame.shape[0]
                     out_fps = max(8.0, min(60.0, fps_ema or src.stats.fps_hint or 30.0))
-                    writer = cv2.VideoWriter(cfg.SMOKE_RECORD_PATH, fourcc, out_fps, (ow, oh))
+                    writer = cv2.VideoWriter(
+                        cfg.SMOKE_RECORD_PATH, fourcc, out_fps, (DASHBOARD_W, DASHBOARD_H)
+                    )
                     recording = bool(writer.isOpened())
                     print(f"[record] {'started' if recording else 'FAILED'} {cfg.SMOKE_RECORD_PATH}", flush=True)
                 else:
@@ -277,6 +304,10 @@ def main() -> None:
                     print("[record] stopped", flush=True)
 
     finally:
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
         if writer is not None:
             writer.release()
         tracker.close()
