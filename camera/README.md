@@ -109,6 +109,8 @@ Default messages (one line each, ASCII):
 
 Edit [`serial_servo.py`](serial_servo.py) if you prefer `PAN:<angle>` etc.
 
+**Arduino:** ready-to-flash sketch (direct **`Servo`** on pin **9**) and wiring notes are in [`firmware/README.md`](firmware/README.md).
+
 ## rPPG integration
 
 [`rppg_infer.py`](rppg_infer.py) calls `rppg.Model.process_faces_tensor` with **uint8 RGB** tensors `(T, H, W, 3)` — crops are converted from OpenCV **BGR** first. Swap this module if you change engines later.
