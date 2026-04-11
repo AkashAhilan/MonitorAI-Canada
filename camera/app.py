@@ -64,6 +64,19 @@ def main() -> None:
     servo = ServoSerial(cfg.SERIAL_PORT, cfg.SERIAL_BAUD, mock=cfg.MOCK_SERIAL, enabled=cfg.SERIAL_ENABLED)
     pan = RateLimitedPan(servo, cfg.SERVO_COOLDOWN_MS / 1000.0)
 
+    if cfg.MOCK_SERIAL or getattr(servo, "mock", True):
+        print(
+            "\n>>> SERVO: MOCK — [SERVO] lines only go to this window; Arduino USB serial gets NO data.\n"
+            "    To move the real servo: set MOCK_SERIAL=false, SERIAL_PORT=COMx (Device Manager), "
+            "close Arduino Serial Monitor, then run again.\n",
+            flush=True,
+        )
+    elif cfg.SERIAL_ENABLED:
+        print(
+            f"\n>>> SERVO: serial -> {cfg.SERIAL_PORT} @ {cfg.SERIAL_BAUD} (commands sent to Arduino)\n",
+            flush=True,
+        )
+
     win = "Waiting-room monitor (q quit, r reset, s serial, c cap, v rec)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 

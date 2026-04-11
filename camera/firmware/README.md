@@ -48,12 +48,44 @@ python -m camera.app
 
 Press `s` in the app to toggle serial if you test without the Arduino.
 
+## Smoother motion (less choppy)
+
+The sketch **eases** the servo toward each new target instead of jumping the full step at once. Tune at the top of `pan_servo.ino`:
+
+| Constant | Effect |
+|----------|--------|
+| `SMOOTH_INTERVAL_MS` | How often to nudge toward the target (default **8** ms). Lower = more frequent small steps. |
+| `SMOOTH_MAX_STEP` | Max degrees per nudge (default **1**). Lower = smoother; `1` is usually the smoothest. |
+
+If it still feels jittery from the PC sending commands too fast, slightly increase **`SERVO_COOLDOWN_MS`** in Python [`config.py`](../config.py) (e.g. 150–200 ms).
+
 ## If left and right are reversed
 
-Set `SWAP_LEFT_RIGHT` to `true` in `pan_servo.ino`.
+Toggle `SWAP_LEFT_RIGHT` at the top of `pan_servo.ino`.
 
 ## Troubleshooting
 
 - **Port busy:** Close Serial Monitor and other serial tools before `python -m camera.app`.
 - **No movement:** Confirm baud **115200**, correct COM port, and servo power.
 - **Jittery servo:** Reduce `STEP_DEGREES` in the sketch or increase `SERVO_COOLDOWN_MS` in Python [`config.py`](../config.py).
+
+### Servo goes to home on power-up but never moves when tracking
+
+That usually means **Python is not sending bytes to the Arduino**, only printing lines in your PC terminal.
+
+1. **Turn off mock mode** (default is on so you can develop without hardware). In PowerShell before `python -m camera.app`:
+
+   ```powershell
+   $env:MOCK_SERIAL="false"
+   $env:SERIAL_PORT="COM4"   # Device Manager → Ports — match your Arduino
+   ```
+
+   Or set `MOCK_SERIAL = False` and `SERIAL_PORT = "COM4"` in [`../config.py`](../config.py).
+
+2. **Close Arduino Serial Monitor** (and any other app using that COM port). Only **one** program can open the port on Windows; if the Monitor is open, Python cannot send data.
+
+3. When the app starts you should see either  
+   `>>> SERVO: serial -> COMx @ 115200` (good) or  
+   `>>> SERVO: MOCK` (Arduino will not receive commands).
+
+4. Press **`s`** in the app only if you intentionally disabled serial; **`SERIAL_ENABLED`** must be true for output.

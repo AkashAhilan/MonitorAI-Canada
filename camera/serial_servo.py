@@ -34,11 +34,28 @@ class ServoSerial:
         self._ser: Optional["serial.Serial"] = None
         if not mock and enabled and serial is not None:
             try:
-                self._ser = serial.Serial(port, baud, timeout=0.05)
-                log.info("Serial opened %s @ %s", port, baud)
+                # dsrdtr=False avoids extra DTR toggles on Windows that can reset some boards
+                try:
+                    self._ser = serial.Serial(
+                        port,
+                        baud,
+                        timeout=0.05,
+                        write_timeout=2.0,
+                        dsrdtr=False,
+                        rtscts=False,
+                    )
+                except TypeError:
+                    self._ser = serial.Serial(port, baud, timeout=0.05)
+                log.info("Serial OPEN (real hardware): %s @ %s — bytes are sent to Arduino", port, baud)
             except OSError as e:
                 log.warning("Serial open failed (%s); falling back to mock prints", e)
                 self.mock = True
+
+        if self.mock:
+            log.warning(
+                "MOCK_SERIAL: commands only print to this console — nothing is sent to the Arduino. "
+                "Set MOCK_SERIAL=false and SERIAL_PORT to your COM port (and close Arduino Serial Monitor)."
+            )
 
     def close(self) -> None:
         if self._ser is not None:
@@ -55,8 +72,11 @@ class ServoSerial:
         if self.mock or self._ser is None:
             print(f"[SERVO] {line}", flush=True)
             return
-        self._ser.write(payload)
-        self._ser.flush()
+        try:
+            self._ser.write(payload)
+            self._ser.flush()
+        except Exception as e:
+            log.warning("Serial write failed: %s", e)
 
     def send_pan_left(self) -> None:
         self._write_line("PAN_LEFT")

@@ -38,7 +38,7 @@ All defaults live in [`config.py`](config.py). You can override many values with
 | `CAMERA_READ_RETRIES` | Per-frame read retries before reopening the device (default `20`) |
 | `SERIAL_PORT` | e.g. `COM3` |
 | `SERIAL_BAUD` | e.g. `115200` |
-| `MOCK_SERIAL` | `true` = print commands only (default) |
+| `MOCK_SERIAL` | `true` = **print only** (default); Arduino gets **no** serial data. Set `false` + correct `SERIAL_PORT` for a real servo |
 | `SERIAL_ENABLED` | `false` = never open serial (keyboard `s` toggles at runtime in the app) |
 | `DEADBAND_PX` | No pan if horizontal error ≤ this (pixels) |
 | `CENTER_THRESHOLD_PX` | “Centered” for lock counter (pixels) |
